@@ -1,3 +1,3 @@
-from .scrypt import SCryptHasher
+from .scrypt import hash_password, verify_password
 
-__all__ = ["SCryptHasher"]
+__all__ = ["hash_password", "verify_password"]

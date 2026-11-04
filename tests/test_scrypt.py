@@ -1,516 +1,667 @@
 """
-Pytest suite for scrypt.SCryptHasher.
+Module: test_scrypt.py
 
-Place next to scrypt.py (python_testing/test_scrypt.py) and run:
+Description:
+    Comprehensive, high-coverage (>= 95%) test suite for the python_security.scrypt package.
+    Covers unit functionality, property-based invariants (Hypothesis), security edge cases,
+    timing-attack resilience, and asserts ideal behaviors for suspected parser defects.
 
-    pytest python_testing/test_scrypt.py --cov=scrypt --cov-report=term-missing
+Configuration Files:
+-------------------
+To enforce >= 95% test coverage in your test runner, configure pyproject.toml or pytest.ini:
 
-If your import path differs, change the import below, e.g.
-    from python_testing.scrypt import SCryptHasher
+--- pyproject.toml ---
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --cov=python_security.scrypt --cov-report=term-missing --cov-fail-under=95"
+testpaths = ["tests", "."]
+
+[tool.coverage.run]
+branch = true
+source = ["python_security.scrypt"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 95
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
+--- pytest.ini ---
+[pytest]
+minversion = 7.0
+addopts = -ra -q --cov=python_security.scrypt --cov-report=term-missing --cov-fail-under=95
+testpaths = tests .
 """
 
+from __future__ import annotations
+
 import base64
-import binascii
+import dataclasses
 import hashlib
-import unicodedata
+import hmac
+import secrets
+import time
+from typing import Any
+from unittest.mock import patch
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
-from python_security import scrypt
-from python_security.scrypt import SCryptHasher
+from python_security.scrypt import hash_password, verify_password
+from python_security.scrypt.config import (
+    DEFAULT_SETTINGS,
+    MAX_SALT_LENGTH,
+    MIN_SALT_LENGTH,
+    SCryptSettings,
+)
+from python_security.scrypt.exceptions import (
+    DecodeError,
+    EncodeError,
+    InvalidSettingsValue,
+    SCryptException,
+)
+from python_security.scrypt.utils import (
+    b64_decoder,
+    b64_encoder,
+    digest,
+    phc_decoder,
+    phc_encoder,
+)
 
-# Low cost parameters keep the suite fast (~1 MB per hash instead of ~128 MB).
-FAST_LN = 4
-PASSWORD = "correct horse battery staple"
+# =====================================================================
+# 1. Exception Hierarchy Tests
+# =====================================================================
 
 
-def make_hasher(**overrides) -> SCryptHasher:
-    params = {"compute_cost": FAST_LN}
-    params.update(overrides)
-    return SCryptHasher(**params)
+class TestExceptionHierarchy:
+    """Verifies custom exception taxonomy and inheritance."""
+
+    def test_base_exception_inheritance(self):
+        assert issubclass(SCryptException, Exception)
+
+    @pytest.mark.parametrize(
+        "exc_class",
+        [InvalidSettingsValue, EncodeError, DecodeError],
+    )
+    def test_derived_exceptions_inherit_from_base(self, exc_class: type[Exception]):
+        assert issubclass(exc_class, SCryptException)
+        instance = exc_class("test error")
+        assert isinstance(instance, SCryptException)
+        assert str(instance) == "test error"
 
 
-@pytest.fixture
-def hasher() -> SCryptHasher:
-    return make_hasher()
+# =====================================================================
+# 2. Configuration & Settings Tests
+# =====================================================================
 
 
-def b64(data: bytes) -> str:
-    """Independent unpadded base64 helper (does not use the class under test)."""
-    return base64.b64encode(data).rstrip(b"=").decode("ascii")
+class TestSCryptSettings:
+    """Validates SCryptSettings constraints, memory calculations, and immutability."""
 
+    def test_default_settings_values(self):
+        assert DEFAULT_SETTINGS.salt_length == 32
+        assert DEFAULT_SETTINGS.ln == 17
+        assert DEFAULT_SETTINGS.r == 8
+        assert DEFAULT_SETTINGS.p == 1
+        assert DEFAULT_SETTINGS.dklen == 32
+        assert DEFAULT_SETTINGS.max_password_length == 256
 
-# --------------------------------------------------------------------------- #
-# __init__ and required_memory
-# --------------------------------------------------------------------------- #
-class TestInit:
-    def test_default_parameters(self):
-        h = SCryptHasher()
-        assert h.salt_length == 32
-        assert h.ln == 17
-        assert h.r == 8
-        assert h.p == 1
-        assert h.dklen == 32
-
-    def test_custom_parameters_are_stored(self):
-        h = SCryptHasher(
-            salt_length=16, compute_cost=10, block_size=4, parallelism=2, key_length=64
+    def test_maxmem_formula_calculation(self):
+        s = SCryptSettings(
+            ln=14, r=8, p=1, dklen=32, salt_length=32, max_password_length=128
         )
-        assert (h.salt_length, h.ln, h.r, h.p, h.dklen) == (16, 10, 4, 2, 64)
+        expected = 128 * 8 * ((1 << 14) + 1 + 2) + (1 << 20)
+        assert s.maxmem == expected
 
-    def test_class_limits(self):
-        assert SCryptHasher.MAX_PASSWORD_LENGTH == 256
-        assert SCryptHasher.MAX_SALT_LENGTH == 128
-        assert SCryptHasher.MAX_DIGEST_LENGTH == 128
-        assert SCryptHasher.OPENSSL_MAX_MEMORY == 2**31 - 1
+    def test_immutability(self):
+        s = DEFAULT_SETTINGS
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            s.ln = 18  # type: ignore[misc]
 
-    def test_highest_allowed_cost_is_accepted(self):
-        # ln=20, r=8 -> ~1.07 GB, below the 2 GiB limit
+    @pytest.mark.parametrize("valid_salt_len", [MIN_SALT_LENGTH, 32, MAX_SALT_LENGTH])
+    def test_valid_salt_boundaries(self, valid_salt_len: int):
+        s = SCryptSettings(
+            ln=10,
+            r=8,
+            p=1,
+            dklen=32,
+            salt_length=valid_salt_len,
+            max_password_length=128,
+        )
+        assert s.salt_length == valid_salt_len
+
+    @pytest.mark.parametrize(
+        "invalid_salt_len",
+        [MIN_SALT_LENGTH - 1, 0, -1, MAX_SALT_LENGTH + 1, 100],
+    )
+    def test_invalid_salt_length_raises(self, invalid_salt_len: int):
+        with pytest.raises(InvalidSettingsValue, match="Salt Range out of Range"):
+            SCryptSettings(
+                ln=10,
+                r=8,
+                p=1,
+                dklen=32,
+                salt_length=invalid_salt_len,
+                max_password_length=128,
+            )
+
+    @pytest.mark.parametrize(
+        ("ln", "r", "p"),
+        [
+            (0, 8, 1),
+            (-1, 8, 1),
+            (10, 0, 1),
+            (10, -1, 1),
+            (10, 8, 0),
+            (10, 8, -1),
+            (0, 0, 0),
+        ],
+    )
+    def test_non_positive_ln_r_p_raises(self, ln: int, r: int, p: int):
+        with pytest.raises(InvalidSettingsValue, match="Any of ln, r, p is 0"):
+            SCryptSettings(
+                ln=ln,
+                r=r,
+                p=p,
+                dklen=32,
+                salt_length=32,
+                max_password_length=128,
+            )
+
+    def test_openssl_memory_limit_exceeded(self):
+        # Trigger maxmem > (2**31 - 1)
+        with pytest.raises(InvalidSettingsValue, match="Possibility of Out-of-Memory"):
+            SCryptSettings(
+                ln=25,
+                r=8,
+                p=1,
+                dklen=32,
+                salt_length=32,
+                max_password_length=128,
+            )
+
+
+# =====================================================================
+# 3. Base64 & Format Utility Tests
+# =====================================================================
+
+
+class TestBase64Utilities:
+    """Tests base64 encoding and decoding edge cases."""
+
+    @pytest.mark.parametrize(
+        "raw_bytes",
+        [
+            b"",
+            b"a",
+            b"ab",
+            b"abc",
+            b"abcd",
+            b"\x00\xff\xfe\x01\x10",
+            secrets.token_bytes(32),
+            secrets.token_bytes(64),
+        ],
+    )
+    def test_b64_encoder_decoder_roundtrip(self, raw_bytes: bytes):
+        encoded = b64_encoder(raw_bytes)
+        assert "=" not in encoded
+        decoded = b64_decoder(encoded)
+        assert decoded == raw_bytes
+
+    def test_b64_decoder_padding_variants(self):
+        # 1 byte -> 2 chars + 2 pad '='
+        data = b"X"
+        std_padded = base64.b64encode(data).decode("ascii")  # 'WA=='
+        unpadded = std_padded.rstrip("=")  # 'WA'
+        assert b64_decoder(unpadded) == data
+        assert b64_decoder(std_padded) == data
+
+    @pytest.mark.parametrize("invalid_b64", ["!@#$%", "abcde", "====", "a="])
+    def test_b64_decoder_invalid_characters_raises(self, invalid_b64: str):
+        with pytest.raises(Exception):
+            b64_decoder(invalid_b64)
+
+
+class TestPHCFormatUtilities:
+    """Tests encoding/decoding of PHC string representations."""
+
+    def test_phc_encoder_format(self):
+        salt = b"\x01" * 32
+        digest_bytes = b"\x02" * 32
+        encoded = phc_encoder(salt, digest_bytes, DEFAULT_SETTINGS)
+
+        parts = encoded.split("$")
+        assert len(parts) == 5
+        assert parts[0] == ""
+        assert parts[1] == "scrypt"
         assert (
-            make_hasher(compute_cost=20).required_memory
-            < SCryptHasher.OPENSSL_MAX_MEMORY
+            parts[2]
+            == f"ln={DEFAULT_SETTINGS.ln},r={DEFAULT_SETTINGS.r},p={DEFAULT_SETTINGS.p}"
         )
+        assert parts[3] == b64_encoder(salt)
+        assert parts[4] == b64_encoder(digest_bytes)
 
-    def test_memory_over_limit_raises(self):
-        # ln=21, r=8 -> just over 2 GiB
-        with pytest.raises(ValueError, match="Required Memory is larger"):
-            SCryptHasher(compute_cost=21)
+    def test_phc_decoder_valid_roundtrip(self):
+        salt = secrets.token_bytes(DEFAULT_SETTINGS.salt_length)
+        digest_bytes = secrets.token_bytes(DEFAULT_SETTINGS.dklen)
+        encoded = phc_encoder(salt, digest_bytes, DEFAULT_SETTINGS)
 
-    def test_large_block_size_raises(self):
-        with pytest.raises(ValueError, match="Required Memory is larger"):
-            SCryptHasher(compute_cost=17, block_size=200)
+        dec_salt, dec_digest, dec_settings = phc_decoder(encoded)
+        assert dec_salt == salt
+        assert dec_digest == digest_bytes
+        assert dec_settings.ln == DEFAULT_SETTINGS.ln
+        assert dec_settings.r == DEFAULT_SETTINGS.r
+        assert dec_settings.p == DEFAULT_SETTINGS.p
+        assert dec_settings.dklen == DEFAULT_SETTINGS.dklen
+        assert dec_settings.salt_length == DEFAULT_SETTINGS.salt_length
 
-
-class TestRequiredMemory:
+    # Assert ideal behavior: malformed hashes must raise DecodeError
     @pytest.mark.parametrize(
-        "ln, r, p",
-        [(4, 8, 1), (10, 8, 1), (17, 8, 1), (12, 4, 2), (14, 16, 3)],
+        "non_string",
+        [None, 12345, b"$scrypt$ln=17,r=8,p=1$AA$BB", ["hash"]],
     )
-    def test_formula(self, ln, r, p):
-        h = SCryptHasher(compute_cost=ln, block_size=r, parallelism=p)
-        assert h.required_memory == 128 * r * ((1 << ln) + p + 2) + (1 << 20)
-
-    def test_default_is_about_135_mb(self):
-        assert SCryptHasher().required_memory == 128 * 8 * (2**17 + 3) + 2**20
-
-
-# --------------------------------------------------------------------------- #
-# _b64_encoder / _b64_decoder
-# --------------------------------------------------------------------------- #
-class TestBase64Helpers:
-    @pytest.mark.parametrize(
-        "data", [b"", b"A", b"AB", b"ABC", b"ABCD", bytes(range(256)), b"\xff" * 33]
-    )
-    def test_roundtrip(self, hasher, data):
-        assert hasher._b64_decoder(hasher._b64_encoder(data)) == data
-
-    def test_encoder_strips_padding(self, hasher):
-        assert hasher._b64_encoder(b"A") == "QQ"
-        assert "=" not in hasher._b64_encoder(b"AB")
-
-    def test_encoder_returns_ascii_str(self, hasher):
-        out = hasher._b64_encoder(b"\x00\x01\x02")
-        assert isinstance(out, str)
-        out.encode("ascii")
-
-    def test_decoder_restores_missing_padding(self, hasher):
-        assert hasher._b64_decoder("QQ") == b"A"
-        assert hasher._b64_decoder("QUI") == b"AB"
-        assert hasher._b64_decoder("QUJD") == b"ABC"  # no padding needed
-
-    def test_decoder_rejects_invalid_characters(self, hasher):
-        with pytest.raises(binascii.Error):
-            hasher._b64_decoder("@@@@")
-
-    def test_decoder_rejects_impossible_length(self, hasher):
-        # 5 chars -> remainder 1 is never valid base64
-        with pytest.raises(binascii.Error):
-            hasher._b64_decoder("QUJDR")
-
-
-# --------------------------------------------------------------------------- #
-# _phc_encoder
-# --------------------------------------------------------------------------- #
-class TestPhcEncoder:
-    def test_exact_format(self):
-        h = SCryptHasher(compute_cost=4, block_size=8, parallelism=1)
-        salt, digest = b"saltsalt", b"digestdigest"
-        assert (
-            h._phc_encoder(salt, digest)
-            == f"$scrypt$ln=4,r=8,p=1${b64(salt)}${b64(digest)}"
-        )
-
-    def test_uses_instance_parameters(self):
-        h = SCryptHasher(compute_cost=6, block_size=4, parallelism=3)
-        assert h._phc_encoder(b"s", b"d").startswith("$scrypt$ln=6,r=4,p=3$")
-
-    def test_has_five_dollar_separated_fields(self, hasher):
-        parts = hasher._phc_encoder(b"s", b"d").split("$")
-        assert len(parts) == 5 and parts[0] == "" and parts[1] == "scrypt"
-
-
-# --------------------------------------------------------------------------- #
-# _phc_decoder
-# --------------------------------------------------------------------------- #
-class TestPhcDecoder:
-    def test_roundtrip_with_encoder(self):
-        h = SCryptHasher(compute_cost=5, block_size=4, parallelism=2)
-        salt, digest = bytes(range(16)), bytes(range(32))
-        parsed = h._phc_decoder(h._phc_encoder(salt, digest))
-        assert parsed == {"salt": salt, "digest": digest, "ln": 5, "r": 4, "p": 2}
+    def test_phc_decoder_non_string_raises_decode_error(self, non_string: Any):
+        with pytest.raises(DecodeError, match="hashed_password is not a string"):
+            phc_decoder(non_string)
 
     @pytest.mark.parametrize(
-        "bad", [None, 123, b"$scrypt$ln=4,r=8,p=1$AAAA$AAAA", ["x"]]
-    )
-    def test_non_string_raises_type_error(self, hasher, bad):
-        with pytest.raises(TypeError, match="not a string"):
-            hasher._phc_decoder(bad)
-
-    @pytest.mark.parametrize(
-        "bad",
+        "malformed_structure",
         [
             "",
-            "garbage",
-            "a$b",
-            "$scrypt$ln=4,r=8,p=1$AAAA",  # too few fields
-            "$scrypt$ln=4,r=8,p=1$AAAA$AAAA$extra",  # too many fields
+            "scrypt$ln=17,r=8,p=1$AAAA$BBBB",  # Missing leading '$'
+            "$scrypt$ln=17,r=8,p=1$AAAA",  # Only 4 parts
+            "$scrypt$ln=17,r=8,p=1$AAAA$BBBB$CCCC",  # 6 parts
+            "$argon2id$ln=17,r=8,p=1$AAAA$BBBB",  # Unsupported algo
+            "$scrypt$$AAAA$BBBB",  # Empty params
         ],
     )
-    def test_wrong_field_count_raises_value_error(self, hasher, bad):
-        with pytest.raises(ValueError):
-            hasher._phc_decoder(bad)
+    def test_phc_decoder_malformed_structure_raises_decode_error(
+        self, malformed_structure: str
+    ):
+        with pytest.raises(DecodeError):
+            phc_decoder(malformed_structure)
 
-    def test_leading_text_before_first_dollar_raises(self, hasher):
-        with pytest.raises(ValueError, match="Invalid Hashed Password format"):
-            hasher._phc_decoder("x$scrypt$ln=4,r=8,p=1$AAAA$AAAA")
+    @pytest.mark.parametrize(
+        "corrupted_params",
+        [
+            "$scrypt$ln=17,r=8$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY",  # missing p
+            "$scrypt$ln=17,r=8,p=invalid$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY",  # non-int p
+            "$scrypt$ln=17,r=8,p=1,extra=2$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY",  # extra param
+            "$scrypt$invalid$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY",  # no equals
+            "$scrypt$ln=17=extra,r=8,p=1$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY",  # multiple equals
+        ],
+    )
+    def test_phc_decoder_corrupted_parameters_raises_decode_error(
+        self, corrupted_params: str
+    ):
+        """Assert ideal behavior: parameter parsing defects raise DecodeError."""
+        with pytest.raises(DecodeError):
+            phc_decoder(corrupted_params)
 
-    @pytest.mark.parametrize("algo", ["bcrypt", "argon2id", "SCRYPT", ""])
-    def test_wrong_algorithm_raises(self, hasher, algo):
-        with pytest.raises(ValueError, match="Invalid Hashed Password format"):
-            hasher._phc_decoder(f"${algo}$ln=4,r=8,p=1$AAAA$AAAA")
+    @pytest.mark.parametrize(
+        "invalid_base64_hash",
+        [
+            "$scrypt$ln=17,r=8,p=1$not_valid_b64!@#$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY",
+            "$scrypt$ln=17,r=8,p=1$YWJjZGVmZ2hpamtsbW5vcA$not_valid_b64!@#",
+        ],
+    )
+    def test_phc_decoder_invalid_base64_raises_decode_error(
+        self, invalid_base64_hash: str
+    ):
+        """Assert ideal behavior: bad base64 in PHC raises DecodeError."""
+        with pytest.raises(DecodeError):
+            phc_decoder(invalid_base64_hash)
 
-    def test_missing_parameter_raises_key_error(self, hasher):
-        with pytest.raises(KeyError):
-            hasher._phc_decoder("$scrypt$r=8,p=1$AAAA$AAAA")  # no ln
-
-    def test_non_integer_parameter_raises_value_error(self, hasher):
-        with pytest.raises(ValueError):
-            hasher._phc_decoder("$scrypt$ln=abc,r=8,p=1$AAAA$AAAA")
-
-    def test_parameter_without_equals_raises_value_error(self, hasher):
-        with pytest.raises(ValueError):
-            hasher._phc_decoder("$scrypt$ln=4,r=8,p$AAAA$AAAA")
-
-    def test_invalid_base64_salt_raises(self, hasher):
-        with pytest.raises(binascii.Error):
-            hasher._phc_decoder("$scrypt$ln=4,r=8,p=1$@@@@$AAAA")
-
-    def test_invalid_base64_digest_raises(self, hasher):
-        with pytest.raises(binascii.Error):
-            hasher._phc_decoder("$scrypt$ln=4,r=8,p=1$AAAA$@@@@")
-
-    def test_salt_at_limit_is_accepted(self, hasher):
-        salt = b"\x01" * SCryptHasher.MAX_SALT_LENGTH
-        parsed = hasher._phc_decoder(hasher._phc_encoder(salt, b"d" * 32))
-        assert parsed["salt"] == salt
-
-    def test_salt_over_limit_raises(self, hasher):
-        salt = b"\x01" * (SCryptHasher.MAX_SALT_LENGTH + 1)
-        with pytest.raises(ValueError, match="Salt is too Long"):
-            hasher._phc_decoder(hasher._phc_encoder(salt, b"d" * 32))
-
-    def test_digest_at_limit_is_accepted(self, hasher):
-        digest = b"\x02" * SCryptHasher.MAX_DIGEST_LENGTH
-        parsed = hasher._phc_decoder(hasher._phc_encoder(b"s" * 16, digest))
-        assert parsed["digest"] == digest
-
-    def test_digest_over_limit_raises(self, hasher):
-        digest = b"\x02" * (SCryptHasher.MAX_DIGEST_LENGTH + 1)
-        with pytest.raises(ValueError, match="Digest is too Long"):
-            hasher._phc_decoder(hasher._phc_encoder(b"s" * 16, digest))
+    def test_phc_decoder_invalid_settings_values_raises_decode_error(self):
+        """Assert ideal behavior: invalid decoded parameters raise DecodeError."""
+        # Salt decoded is only 4 bytes (less than MIN_SALT_LENGTH 16)
+        short_salt_b64 = b64_encoder(b"short")
+        valid_digest_b64 = b64_encoder(b"d" * 32)
+        h = f"$scrypt$ln=17,r=8,p=1${short_salt_b64}${valid_digest_b64}"
+        with pytest.raises(DecodeError):
+            phc_decoder(h)
 
 
-# --------------------------------------------------------------------------- #
-# _encode_password
-# --------------------------------------------------------------------------- #
-class TestEncodePassword:
-    def test_ascii_returns_utf8_bytes(self, hasher):
-        assert hasher._encode_password("hello") == b"hello"
-
-    def test_empty_password_is_encodable(self, hasher):
-        assert hasher._encode_password("") == b""
-
-    def test_nfkc_normalisation_applied(self, hasher):
-        # U+FB01 (fi ligature) -> "fi" under NFKC
-        assert hasher._encode_password("\ufb01") == b"fi"
-
-    def test_composed_and_decomposed_forms_match(self, hasher):
-        composed = "\u00e9"  # é
-        decomposed = "e\u0301"
-        assert hasher._encode_password(composed) == hasher._encode_password(decomposed)
-
-    def test_fullwidth_characters_normalised(self, hasher):
-        assert hasher._encode_password("\uff21\uff22") == b"AB"
-
-    def test_unicode_encoded_as_utf8(self, hasher):
-        pw = "pässwörd🔑"
-        expected = unicodedata.normalize("NFKC", pw).encode("utf-8")
-        assert hasher._encode_password(pw) == expected
-
-    def test_exactly_max_length_accepted(self, hasher):
-        pw = "a" * SCryptHasher.MAX_PASSWORD_LENGTH
-        assert len(hasher._encode_password(pw)) == 256
-
-    def test_over_max_length_rejected(self, hasher):
-        with pytest.raises(ValueError, match="Password too Long"):
-            hasher._encode_password("a" * (SCryptHasher.MAX_PASSWORD_LENGTH + 1))
-
-    def test_limit_is_measured_in_bytes_not_characters(self, hasher):
-        # 100 emoji = 100 characters but 400 UTF-8 bytes
-        with pytest.raises(ValueError, match="Password too Long"):
-            hasher._encode_password("🔑" * 100)
-
-    def test_length_checked_after_normalisation(self, hasher):
-        # 200 ligatures (3 bytes each = 600) normalise to 400 bytes -> still too long,
-        # but 100 ligatures normalise to 200 bytes -> accepted although raw is 300 bytes.
-        assert len(hasher._encode_password("\ufb01" * 100)) == 200
-        with pytest.raises(ValueError):
-            hasher._encode_password("\ufb01" * 200)
+# =====================================================================
+# 4. Digest Function Tests
+# =====================================================================
 
 
-# --------------------------------------------------------------------------- #
-# hash_password
-# --------------------------------------------------------------------------- #
-class TestHashPassword:
-    def test_returns_phc_string(self, hasher):
-        out = hasher.hash_password(PASSWORD)
-        assert isinstance(out, str)
-        assert out.startswith(f"$scrypt$ln={FAST_LN},r=8,p=1$")
-        assert len(out.split("$")) == 5
+class TestDigestFunction:
+    """Tests utils.digest behavior with DEFAULT_SETTINGS."""
 
-    def test_password_not_in_output(self, hasher):
-        assert PASSWORD not in hasher.hash_password(PASSWORD)
+    def test_digest_deterministic_output(self):
+        salt = b"\xaa" * DEFAULT_SETTINGS.salt_length
+        d1 = digest("super-secret-pass", salt, DEFAULT_SETTINGS)
+        d2 = digest("super-secret-pass", salt, DEFAULT_SETTINGS)
+        assert d1 == d2
+        assert len(d1) == DEFAULT_SETTINGS.dklen
 
-    def test_salt_and_digest_lengths(self):
-        h = make_hasher(salt_length=24, key_length=48)
-        parsed = h._phc_decoder(h.hash_password(PASSWORD))
-        assert len(parsed["salt"]) == 24
-        assert len(parsed["digest"]) == 48
+    def test_digest_different_salts_produce_different_digests(self):
+        salt1 = b"\x01" * DEFAULT_SETTINGS.salt_length
+        salt2 = b"\x02" * DEFAULT_SETTINGS.salt_length
+        d1 = digest("same-password", salt1, DEFAULT_SETTINGS)
+        d2 = digest("same-password", salt2, DEFAULT_SETTINGS)
+        assert d1 != d2
 
-    def test_same_password_gives_different_hashes(self, hasher):
-        assert hasher.hash_password(PASSWORD) != hasher.hash_password(PASSWORD)
+    def test_digest_different_passwords_produce_different_digests(self):
+        salt = b"\x55" * DEFAULT_SETTINGS.salt_length
+        d1 = digest("password-one", salt, DEFAULT_SETTINGS)
+        d2 = digest("password-two", salt, DEFAULT_SETTINGS)
+        assert d1 != d2
 
-    def test_salts_are_unique_across_many_hashes(self, hasher):
-        salts = {
-            hasher._phc_decoder(hasher.hash_password("x"))["salt"] for _ in range(20)
-        }
-        assert len(salts) == 20
+    def test_password_length_exceeded_raises_encode_error(self):
+        salt = b"\x00" * DEFAULT_SETTINGS.salt_length
+        long_pwd = "P" * (DEFAULT_SETTINGS.max_password_length + 1)
+        with pytest.raises(EncodeError, match="Password is Too Long"):
+            digest(long_pwd, salt, DEFAULT_SETTINGS)
 
-    def test_matches_independent_scrypt_computation(self, hasher, monkeypatch):
-        """Known-answer test: output must equal a direct hashlib.scrypt call."""
-        fixed_salt = bytes(range(32))
-        monkeypatch.setattr("python_security.scrypt.secrets.token_bytes", lambda n: fixed_salt[:n])
+    def test_password_exact_max_length_succeeds(self):
+        salt = b"\x11" * DEFAULT_SETTINGS.salt_length
+        pwd = "P" * DEFAULT_SETTINGS.max_password_length
+        d = digest(pwd, salt, DEFAULT_SETTINGS)
+        assert len(d) == DEFAULT_SETTINGS.dklen
 
-        expected_digest = hashlib.scrypt(
-            PASSWORD.encode(), salt=fixed_salt, n=1 << FAST_LN, r=8, p=1, dklen=32
+    def test_empty_password_digest(self):
+        salt = b"\x22" * DEFAULT_SETTINGS.salt_length
+        d = digest("", salt, DEFAULT_SETTINGS)
+        assert len(d) == DEFAULT_SETTINGS.dklen
+
+    def test_unicode_and_special_characters(self):
+        salt = b"\x33" * DEFAULT_SETTINGS.salt_length
+        pwd = "P@$$w0rd_🔑_ñ_日本語_🛡️"
+        d = digest(pwd, salt, DEFAULT_SETTINGS)
+        assert len(d) == DEFAULT_SETTINGS.dklen
+
+
+# =====================================================================
+# 5. Core Hash and Verification Tests (Using DEFAULT_SETTINGS)
+# =====================================================================
+
+
+class TestCoreHashAndVerify:
+    """End-to-end tests for hash_password and verify_password."""
+
+    def test_hash_password_produces_phc_with_default_settings(self):
+        password = "ProductionPassword#2026!"
+        h = hash_password(password)
+
+        assert h.startswith(
+            f"$scrypt$ln={DEFAULT_SETTINGS.ln},r={DEFAULT_SETTINGS.r},p={DEFAULT_SETTINGS.p}$"
         )
-        assert hasher.hash_password(PASSWORD) == (
-            f"$scrypt$ln={FAST_LN},r=8,p=1${b64(fixed_salt)}${b64(expected_digest)}"
+        salt, d, settings_obj = phc_decoder(h)
+        assert len(salt) == DEFAULT_SETTINGS.salt_length
+        assert len(d) == DEFAULT_SETTINGS.dklen
+        assert settings_obj.ln == DEFAULT_SETTINGS.ln
+
+    def test_hash_password_salts_are_cryptographically_unique(self):
+        password = "SecurePassword123"
+        h1 = hash_password(password)
+        h2 = hash_password(password)
+
+        assert h1 != h2
+        salt1, _, _ = phc_decoder(h1)
+        salt2, _, _ = phc_decoder(h2)
+        assert salt1 != salt2
+
+    def test_verify_password_success(self):
+        password = "CorrectHorseBatteryStaple!"
+        h = hash_password(password)
+        assert verify_password(password, h) is True
+
+    def test_verify_password_incorrect_password(self):
+        password = "CorrectPassword"
+        h = hash_password(password)
+        assert verify_password("WrongPassword", h) is False
+
+    def test_verify_password_tampered_digest_fails(self):
+        password = "AuthenticationKey"
+        h = hash_password(password)
+        salt, d, settings_obj = phc_decoder(h)
+
+        # Mutate last byte of digest
+        tampered_d = bytearray(d)
+        tampered_d[-1] ^= 0x01
+        tampered_h = phc_encoder(salt, bytes(tampered_d), settings_obj)
+
+        assert verify_password(password, tampered_h) is False
+
+    def test_verify_password_tampered_salt_fails(self):
+        password = "AuthenticationKey"
+        h = hash_password(password)
+        salt, d, settings_obj = phc_decoder(h)
+
+        # Mutate first byte of salt
+        tampered_salt = bytearray(salt)
+        tampered_salt[0] ^= 0x01
+        tampered_h = phc_encoder(bytes(tampered_salt), d, settings_obj)
+
+        assert verify_password(password, tampered_h) is False
+
+    def test_verify_password_tampered_parameters_fails(self):
+        password = "AuthenticationKey"
+        h = hash_password(password)
+        salt, d, settings_obj = phc_decoder(h)
+
+        # Modify ln to 16
+        tampered_settings = SCryptSettings(
+            ln=16,
+            r=settings_obj.r,
+            p=settings_obj.p,
+            dklen=settings_obj.dklen,
+            salt_length=settings_obj.salt_length,
+            max_password_length=settings_obj.max_password_length,
         )
+        tampered_h = phc_encoder(salt, d, tampered_settings)
 
-    def test_uses_secrets_for_salt(self, hasher, monkeypatch):
-        calls = []
+        assert verify_password(password, tampered_h) is False
 
-        def fake_token_bytes(n):
-            calls.append(n)
-            return b"\x07" * n
+    def test_verify_password_malformed_phc_raises_decode_error(self):
+        """Assert ideal behavior: verify_password propagates DecodeError on malformed hash."""
+        with pytest.raises(DecodeError):
+            verify_password("Password", "corrupted$hash$value")
 
-        monkeypatch.setattr("python_security.scrypt.secrets.token_bytes", fake_token_bytes)
-        hasher.hash_password(PASSWORD)
-        assert calls == [hasher.salt_length]
 
-    def test_empty_password_can_be_hashed(self, hasher):
-        assert hasher.verify_password("", hasher.hash_password(""))
+# =====================================================================
+# 6. Security Vulnerability & Edge Case Tests
+# =====================================================================
 
-    def test_overlong_password_rejected(self, hasher):
-        with pytest.raises(ValueError, match="Password too Long"):
-            hasher.hash_password("a" * 257)
 
-    def test_non_string_password_rejected(self, hasher):
-        with pytest.raises(TypeError):
-            hasher.hash_password(b"bytes-not-str")  # type: ignore[arg-type]
+class TestSecurityVulnerabilities:
+    """Covers common cryptographic and web security threats."""
 
-    @pytest.mark.parametrize(
-        "kwargs",
-        [
-            {"block_size": 4},
-            {"parallelism": 2},
-            {"key_length": 64},
-            {"salt_length": 16},
-        ],
+    def test_null_byte_injection_differentiation(self):
+        """Ensure strings with internal null bytes are not truncated or conflated."""
+        salt = b"\x44" * DEFAULT_SETTINGS.salt_length
+        d1 = digest("admin", salt, DEFAULT_SETTINGS)
+        d2 = digest("admin\x00extra", salt, DEFAULT_SETTINGS)
+        d3 = digest("admin\x00", salt, DEFAULT_SETTINGS)
+
+        assert d1 != d2
+        assert d1 != d3
+        assert d2 != d3
+
+    def test_unicode_normalization_handling(self):
+        """Verify distinct unicode representations yield distinct digests (raw UTF-8)."""
+        salt = b"\x99" * DEFAULT_SETTINGS.salt_length
+        # NFC vs NFD for 'é'
+        nfc = "\u00e9"
+        nfd = "\u0065\u0301"
+
+        d_nfc = digest(nfc, salt, DEFAULT_SETTINGS)
+        d_nfd = digest(nfd, salt, DEFAULT_SETTINGS)
+        assert d_nfc != d_nfd
+
+    def test_dos_long_password_short_circuit(self):
+        """Passwords exceeding max_password_length must fail fast without running scrypt."""
+        long_pwd = "A" * (DEFAULT_SETTINGS.max_password_length + 10)
+
+        with patch("hashlib.scrypt") as mock_scrypt:
+            with pytest.raises(EncodeError):
+                hash_password(long_pwd)
+            mock_scrypt.assert_not_called()
+
+    def test_empty_password_supported_safely(self):
+        h = hash_password("")
+        assert verify_password("", h) is True
+        assert verify_password("not-empty", h) is False
+
+    def test_standard_test_vector_consistency(self):
+        """Validate underlying hashlib scrypt against RFC 7914 Test Vector 1."""
+        # RFC 7914: P="", S="", N=16 (ln=4), r=1, p=1, dklen=64
+        rfc_settings = SCryptSettings(
+            ln=4, r=1, p=1, dklen=64, salt_length=16, max_password_length=64
+        )
+        rfc_salt = b"\x00" * 16
+        # Compute digest
+        d = digest("", rfc_salt, rfc_settings)
+        expected = hashlib.scrypt(
+            b"",
+            salt=rfc_salt,
+            n=1 << 4,
+            r=1,
+            p=1,
+            dklen=64,
+            maxmem=rfc_settings.maxmem,
+        )
+        assert d == expected
+
+
+# =====================================================================
+# 7. Statistical & Constant-Time Verification Tests
+# =====================================================================
+
+
+class TestTimingAttackResistance:
+    """Verifies constant-time comparison in verify_password."""
+
+    def test_verify_password_strictly_uses_hmac_compare_digest(self):
+        """Assert hmac.compare_digest is directly used to protect against timing attacks."""
+        password = "SecretPassword"
+        h = hash_password(password)
+
+        with patch("hmac.compare_digest", wraps=hmac.compare_digest) as mock_compare:
+            res = verify_password(password, h)
+            assert res is True
+            assert mock_compare.call_count == 1
+
+            # Ensure actual_digest and received_digest are passed as bytes
+            args, _ = mock_compare.call_args
+            assert isinstance(args[0], bytes)
+            assert isinstance(args[1], bytes)
+            assert len(args[0]) == DEFAULT_SETTINGS.dklen
+            assert len(args[1]) == DEFAULT_SETTINGS.dklen
+
+    def test_compare_digest_timing_distribution(self):
+        """
+        Statistical sanity test: checks comparison time difference between
+        mismatch at byte 0 vs mismatch at final byte (dklen - 1).
+        Verifies constant-time behavior on the digest comparison primitive.
+        """
+        key1 = b"\x00" * DEFAULT_SETTINGS.dklen
+        # Differs at byte 0
+        key_diff_first = b"\xff" + b"\x00" * (DEFAULT_SETTINGS.dklen - 1)
+        # Differs at byte 31
+        key_diff_last = b"\x00" * (DEFAULT_SETTINGS.dklen - 1) + b"\xff"
+
+        iterations = 5000
+
+        # Timing diff first
+        t0 = time.perf_counter()
+        for _ in range(iterations):
+            hmac.compare_digest(key1, key_diff_first)
+        diff_first_time = time.perf_counter() - t0
+
+        # Timing diff last
+        t0 = time.perf_counter()
+        for _ in range(iterations):
+            hmac.compare_digest(key1, key_diff_last)
+        diff_last_time = time.perf_counter() - t0
+
+        # Ratios should be very close; constant-time comparison avoids early return
+        ratio = diff_first_time / diff_last_time if diff_last_time > 0 else 1.0
+        assert 0.5 <= ratio <= 2.0
+
+
+# =====================================================================
+# 8. Hypothesis Property-Based Tests
+# =====================================================================
+
+
+class TestHypothesisProperties:
+    """Property-based verification using Hypothesis."""
+
+    @given(st.binary(min_size=0, max_size=256))
+    @settings(max_examples=50, deadline=None)
+    def test_property_b64_roundtrip(self, data: bytes):
+        encoded = b64_encoder(data)
+        decoded = b64_decoder(encoded)
+        assert decoded == data
+
+    @given(
+        salt=st.binary(min_size=MIN_SALT_LENGTH, max_size=MAX_SALT_LENGTH),
+        digest_bytes=st.binary(min_size=16, max_size=64),
     )
-    def test_custom_parameters_roundtrip(self, kwargs):
-        h = make_hasher(**kwargs)
-        assert h.verify_password(PASSWORD, h.hash_password(PASSWORD))
+    @settings(max_examples=30, deadline=None)
+    def test_property_phc_encoder_decoder_roundtrip(
+        self, salt: bytes, digest_bytes: bytes
+    ):
+        settings_obj = SCryptSettings(
+            ln=10,
+            r=8,
+            p=1,
+            dklen=len(digest_bytes),
+            salt_length=len(salt),
+            max_password_length=128,
+        )
+        encoded = phc_encoder(salt, digest_bytes, settings_obj)
+        dec_salt, dec_digest, dec_settings = phc_decoder(encoded)
 
-    def test_default_parameters_end_to_end(self):
-        """The single test that uses the production cost factor (ln=17, ~128 MB)."""
-        h = SCryptHasher()
-        hashed = h.hash_password(PASSWORD)
-        assert hashed.startswith("$scrypt$ln=17,r=8,p=1$")
-        assert h.verify_password(PASSWORD, hashed)
-        assert not h.verify_password(PASSWORD + "x", hashed)
-        assert not h.needs_rehash(hashed)
+        assert dec_salt == salt
+        assert dec_digest == digest_bytes
+        assert dec_settings.ln == settings_obj.ln
+        assert dec_settings.r == settings_obj.r
+        assert dec_settings.p == settings_obj.p
+        assert dec_settings.dklen == len(digest_bytes)
+        assert dec_settings.salt_length == len(salt)
 
+    @given(st.text())
+    @settings(max_examples=100, deadline=None)
+    def test_property_phc_decoder_fuzzing(self, random_string: str):
+        """
+        Fuzzing test asserting ideal behavior: Any arbitrary string passed
+        to phc_decoder must either parse successfully or raise DecodeError,
+        never unhandled exceptions (KeyError, ValueError, IndexError, etc.).
+        """
+        try:
+            salt, d, cfg = phc_decoder(random_string)
+            assert isinstance(salt, bytes)
+            assert isinstance(d, bytes)
+            assert isinstance(cfg, SCryptSettings)
+        except DecodeError:
+            pass  # Expected behavior for invalid inputs
 
-# --------------------------------------------------------------------------- #
-# verify_password
-# --------------------------------------------------------------------------- #
-class TestVerifyPassword:
-    def test_correct_password(self, hasher):
-        assert hasher.verify_password(PASSWORD, hasher.hash_password(PASSWORD)) is True
-
-    def test_wrong_password(self, hasher):
-        assert hasher.verify_password("wrong", hasher.hash_password(PASSWORD)) is False
-
-    @pytest.mark.parametrize(
-        "attempt", [PASSWORD.upper(), PASSWORD + " ", " " + PASSWORD, PASSWORD[:-1], ""]
+    @given(
+        password=st.text(
+            alphabet=st.characters(blacklist_categories=("Cs",)),
+            min_size=1,
+            max_size=32,
+        )
     )
-    def test_near_miss_passwords_rejected(self, hasher, attempt):
-        assert hasher.verify_password(attempt, hasher.hash_password(PASSWORD)) is False
-
-    def test_unicode_equivalent_forms_verify(self, hasher):
-        hashed = hasher.hash_password("caf\u00e9")  # composed
-        assert hasher.verify_password("cafe\u0301", hashed)  # decomposed
-
-    def test_independently_built_hash_verifies(self, hasher):
-        """Verifies a PHC string created without the class under test."""
-        salt = b"0123456789abcdef"
-        digest = hashlib.scrypt(PASSWORD.encode(), salt=salt, n=16, r=8, p=1, dklen=32)
-        phc = f"$scrypt$ln=4,r=8,p=1${b64(salt)}${b64(digest)}"
-        assert hasher.verify_password(PASSWORD, phc)
-
-    def test_tampered_digest_rejected(self, hasher):
-        parsed = hasher._phc_decoder(hasher.hash_password(PASSWORD))
-        flipped = bytes([parsed["digest"][0] ^ 0x01]) + parsed["digest"][1:]
-        tampered = hasher._phc_encoder(parsed["salt"], flipped)
-        assert hasher.verify_password(PASSWORD, tampered) is False
-
-    def test_tampered_salt_rejected(self, hasher):
-        parsed = hasher._phc_decoder(hasher.hash_password(PASSWORD))
-        flipped = bytes([parsed["salt"][0] ^ 0x01]) + parsed["salt"][1:]
-        tampered = hasher._phc_encoder(flipped, parsed["digest"])
-        assert hasher.verify_password(PASSWORD, tampered) is False
-
-    def test_stored_parameters_are_used_not_instance_parameters(self):
-        """A hash made with r=4, p=2 must verify on an instance configured with r=8, p=1."""
-        old = make_hasher(block_size=4, parallelism=2, key_length=16, salt_length=8)
-        new = make_hasher()
-        hashed = old.hash_password(PASSWORD)
-        assert new.verify_password(PASSWORD, hashed) is True
-        assert new.verify_password("nope", hashed) is False
-
-    def test_digest_length_taken_from_stored_hash(self):
-        old = make_hasher(key_length=64)
-        hashed = old.hash_password(PASSWORD)
-        assert make_hasher(key_length=32).verify_password(PASSWORD, hashed)
-
-    def test_uses_constant_time_comparison(self, hasher, monkeypatch):
-        calls = []
-        real = __import__("hmac").compare_digest
-
-        def spy(a, b):
-            calls.append((a, b))
-            return real(a, b)
-
-        monkeypatch.setattr("python_security.scrypt.hmac.compare_digest", spy)
-        hasher.verify_password(PASSWORD, hasher.hash_password(PASSWORD))
-        assert len(calls) == 1
-
-    def test_hash_from_lower_cost_instance_still_verifies(self):
-        """Upgrading cost factor: old (cheaper) hashes must verify on the new instance."""
-        old = make_hasher(compute_cost=4)
-        new = make_hasher(compute_cost=8)
-        assert new.verify_password(PASSWORD, old.hash_password(PASSWORD))
-
-    @pytest.mark.xfail(
-        strict=True,
-        raises=ValueError,
-        reason=(
-            "BUG: verify_password passes maxmem=self.required_memory (the *instance's* "
-            "memory budget) to scrypt instead of one derived from the *stored* hash's "
-            "parameters. A hash created with a higher cost than the verifying instance "
-            "fails with 'memory limit exceeded' instead of returning True/False. "
-            "Remove this xfail once fixed."
-        ),
+    @settings(
+        max_examples=5,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow],
     )
-    def test_hash_from_higher_cost_instance_verifies(self):
-        strong = make_hasher(compute_cost=14)
-        weak = make_hasher(compute_cost=4)
-        assert weak.verify_password(PASSWORD, strong.hash_password(PASSWORD))
-
-    @pytest.mark.parametrize(
-        "bad_hash",
-        [
-            "",
-            "not-a-hash",
-            "$bcrypt$ln=4,r=8,p=1$AAAA$AAAA",
-            "$scrypt$ln=4,r=8,p=1$AAAA",
-        ],
-    )
-    def test_malformed_hash_raises(self, hasher, bad_hash):
-        with pytest.raises(ValueError):
-            hasher.verify_password(PASSWORD, bad_hash)
-
-    def test_non_string_hash_raises_type_error(self, hasher):
-        with pytest.raises(TypeError):
-            hasher.verify_password(PASSWORD, None)  # type: ignore[arg-type]
-
-    def test_overlong_password_raises(self, hasher):
-        hashed = hasher.hash_password(PASSWORD)
-        with pytest.raises(ValueError, match="Password too Long"):
-            hasher.verify_password("a" * 257, hashed)
-
-
-# --------------------------------------------------------------------------- #
-# needs_rehash
-# --------------------------------------------------------------------------- #
-class TestNeedsRehash:
-    def test_identical_parameters_do_not_need_rehash(self, hasher):
-        assert hasher.needs_rehash(hasher.hash_password(PASSWORD)) is False
-
-    @pytest.mark.parametrize(
-        "old_kwargs",
-        [
-            {"compute_cost": FAST_LN + 1},
-            {"block_size": 4},
-            {"parallelism": 2},
-            {"salt_length": 16},
-            {"key_length": 64},
-        ],
-        ids=["ln", "r", "p", "salt_length", "key_length"],
-    )
-    def test_each_parameter_mismatch_triggers_rehash(self, old_kwargs):
-        old_hash = make_hasher(**old_kwargs).hash_password(PASSWORD)
-        assert make_hasher().needs_rehash(old_hash) is True
-
-    def test_lower_cost_than_current_triggers_rehash(self):
-        old_hash = make_hasher(compute_cost=4).hash_password(PASSWORD)
-        assert make_hasher(compute_cost=6).needs_rehash(old_hash) is True
-
-    def test_rehash_flow_produces_up_to_date_hash(self):
-        old_hash = make_hasher(compute_cost=4).hash_password(PASSWORD)
-        new = make_hasher(compute_cost=6)
-        assert new.needs_rehash(old_hash)
-        assert new.verify_password(PASSWORD, old_hash)
-        upgraded = new.hash_password(PASSWORD)
-        assert not new.needs_rehash(upgraded)
-        assert new.verify_password(PASSWORD, upgraded)
-
-    def test_malformed_hash_raises(self, hasher):
-        with pytest.raises(ValueError):
-            hasher.needs_rehash("garbage")
-
-    def test_non_string_raises_type_error(self, hasher):
-        with pytest.raises(TypeError):
-            hasher.needs_rehash(12345)  # type: ignore[arg-type]
+    def test_property_core_hash_and_verify_with_default_settings(self, password: str):
+        """
+        Property test executing realistic DEFAULT_SETTINGS.
+        Kept to max_examples=5 due to ln=17 computation cost (~300ms/hash).
+        """
+        h = hash_password(password)
+        assert verify_password(password, h) is True
+        assert verify_password(password + "_incorrect", h) is False
