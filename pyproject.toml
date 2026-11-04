@@ -1,0 +1,16 @@
+[project]
+name = "python-security"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+add-bounds = "major"
+no-cache = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0,<10.0.0",
+    "pytest-cov>=7.1.0,<8.0.0",
+    "ruff>=0.17.3,<0.18.0",
+]
