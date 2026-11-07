@@ -40,7 +40,10 @@ def new_totp_secret(settings: TOTPSettings = TOTPSettings.default()) -> str:
 
 
 def totp_uri(
-    secret: str, account_name: str, issuer: str, settings: TOTPSettings = TOTPSettings.default()
+    secret: str,
+    account_name: str,
+    issuer: str,
+    settings: TOTPSettings = TOTPSettings.default(),
 ) -> str:
     """
     Generates a otpauth://... URI
@@ -78,7 +81,11 @@ def generate_otp(
         raise ValueError("Secret must be at least 16 bytes (128 bits)")
 
     timestamp = time.time() if for_time is None else for_time
-    if not isinstance(timestamp, (int, float)) or math.isnan(timestamp) or math.isinf(timestamp):
+    if (
+        not isinstance(timestamp, (int, float))
+        or math.isnan(timestamp)
+        or math.isinf(timestamp)
+    ):
         raise ValueError("Invalid timestamp")
     if timestamp < 0:
         raise ValueError("Timestamp cannot be negative")

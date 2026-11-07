@@ -1,3 +1,4 @@
+from python_security.jwt.config import JWTSettings
 from python_security.jwt.core import (
     issue_access_token,
     issue_refresh_token,
@@ -7,6 +8,7 @@ from python_security.jwt.core import (
 )
 
 __all__ = [
+    "JWTSettings",
     "issue_access_token",
     "issue_refresh_token",
     "parse_token",

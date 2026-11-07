@@ -70,6 +70,7 @@ def gap(reason: str):
 # Helpers & fixtures & constants
 # --------------------------------------------------------------------------
 
+
 @pytest.fixture(autouse=True)
 def _reset_totp_state():
     if core is not None and hasattr(core, "reset_state"):
@@ -77,6 +78,7 @@ def _reset_totp_state():
     yield
     if core is not None and hasattr(core, "reset_state"):
         core.reset_state()
+
 
 BASE32_ALPHABET = set(string.ascii_uppercase + "234567")
 NOW = 1_700_000_000
@@ -185,7 +187,8 @@ class TestDecodeSecret:
             _decode_secret(bad)
 
     @pytest.mark.parametrize(
-        "bad", ["!!!!!!!!", "JBSW\tY3DP", "JBSWY3D1", "JBSWY3D0", "日本語日本語日本語日本"]
+        "bad",
+        ["!!!!!!!!", "JBSW\tY3DP", "JBSWY3D1", "JBSWY3D0", "日本語日本語日本語日本"],
     )
     def test_invalid_alphabet_raises(self, bad):
         with pytest.raises(ValueError, match="Invalid Base32"):
@@ -369,12 +372,17 @@ class TestUri:
 class TestGenerate:
     @pytest.mark.parametrize("counter", range(10))
     def test_rfc4226_vectors(self, counter):
-        assert core.generate_otp(SECRET, for_time=counter * 30) == RFC4226_VECTORS[counter]
+        assert (
+            core.generate_otp(SECRET, for_time=counter * 30) == RFC4226_VECTORS[counter]
+        )
 
     @pytest.mark.parametrize("t,alg,expected", RFC6238_VECTORS)
     def test_rfc6238_vectors(self, t, alg, expected):
         cfg = mk(algorithm=alg, digits=8)
-        assert core.generate_otp(b32(RFC6238_KEYS[alg]), for_time=t, settings=cfg) == expected
+        assert (
+            core.generate_otp(b32(RFC6238_KEYS[alg]), for_time=t, settings=cfg)
+            == expected
+        )
 
     @given(raw_keys, cfgs, times)
     def test_matches_independent_reference(self, key, cfg, t):
@@ -390,19 +398,24 @@ class TestGenerate:
     def test_counter_offset_equals_time_shift(self, key, cfg, t, k):
         secret = b32(key)
         shifted = core.generate_otp(secret, for_time=t + k * cfg.interval, settings=cfg)
-        assert core.generate_otp(secret, for_time=t, counter_offset=k, settings=cfg) == shifted
+        assert (
+            core.generate_otp(secret, for_time=t, counter_offset=k, settings=cfg)
+            == shifted
+        )
 
     @given(raw_keys, cfgs, times)
     def test_constant_within_a_step(self, key, cfg, t):
         secret = b32(key)
         start = t - (t % cfg.interval)
-        assert core.generate_otp(secret, for_time=start, settings=cfg) == core.generate_otp(
-            secret, for_time=start + cfg.interval - 1, settings=cfg
-        )
+        assert core.generate_otp(
+            secret, for_time=start, settings=cfg
+        ) == core.generate_otp(secret, for_time=start + cfg.interval - 1, settings=cfg)
 
     def test_secret_formatting_does_not_change_output(self):
         spaced = " ".join(SECRET[i : i + 4] for i in range(0, len(SECRET), 4)).lower()
-        assert core.generate_otp(spaced, for_time=NOW) == core.generate_otp(SECRET, for_time=NOW)
+        assert core.generate_otp(spaced, for_time=NOW) == core.generate_otp(
+            SECRET, for_time=NOW
+        )
 
     def test_epoch_zero_is_a_real_timestamp(self):
         assert core.generate_otp(SECRET, for_time=0) == RFC4226_VECTORS[0]
@@ -528,7 +541,9 @@ class TestVerify:
         if result:
             assert otp.strip() in valid_codes(SECRET, NOW, cfg)
 
-    @pytest.mark.parametrize("bad_secret", ["not base32!!", "A", "!!!!!!!!", b32(b"abcd")])
+    @pytest.mark.parametrize(
+        "bad_secret", ["not base32!!", "A", "!!!!!!!!", b32(b"abcd")]
+    )
     def test_invalid_secret_fails_closed(self, bad_secret):
         code = core.generate_otp(SECRET, for_time=NOW)
         assert core.verify_otp(code, bad_secret, for_time=NOW) is False
@@ -559,7 +574,10 @@ class TestVerify:
             return "000000"
 
         monkeypatch.setattr(core, "generate_otp", fake_generate)
-        assert core.verify_otp("123456", SECRET, settings=mk(window=2), for_time=NOW) is False
+        assert (
+            core.verify_otp("123456", SECRET, settings=mk(window=2), for_time=NOW)
+            is False
+        )
         assert seen == [-2, -1, 0, 1, 2]
 
 
