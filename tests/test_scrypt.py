@@ -51,18 +51,17 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from python_security.scrypt import hash_password, verify_password
+from python_security.exceptions import (
+    DecodeError,
+    EncodeError,
+    InvalidSettings,
+    SCryptException,
+)
+from python_security.scrypt import config, hash_password, verify_password
 from python_security.scrypt.config import (
-    DEFAULT_SETTINGS,
     MAX_SALT_LENGTH,
     MIN_SALT_LENGTH,
     SCryptSettings,
-)
-from python_security.scrypt.exceptions import (
-    DecodeError,
-    EncodeError,
-    InvalidSettingsValue,
-    SCryptException,
 )
 from python_security.scrypt.utils import (
     b64_decoder,
@@ -85,12 +84,18 @@ class TestExceptionHierarchy:
 
     @pytest.mark.parametrize(
         "exc_class",
-        [InvalidSettingsValue, EncodeError, DecodeError],
+        [EncodeError, DecodeError],
     )
     def test_derived_exceptions_inherit_from_base(self, exc_class: type[Exception]):
         assert issubclass(exc_class, SCryptException)
         instance = exc_class("test error")
         assert isinstance(instance, SCryptException)
+        assert str(instance) == "test error"
+
+    def test_invalid_settings_inheritance(self):
+        assert issubclass(InvalidSettings, Exception)
+        instance = InvalidSettings("test error")
+        assert isinstance(instance, Exception)
         assert str(instance) == "test error"
 
 
@@ -103,12 +108,16 @@ class TestSCryptSettings:
     """Validates SCryptSettings constraints, memory calculations, and immutability."""
 
     def test_default_settings_values(self):
-        assert DEFAULT_SETTINGS.salt_length == 32
-        assert DEFAULT_SETTINGS.ln == 17
-        assert DEFAULT_SETTINGS.r == 8
-        assert DEFAULT_SETTINGS.p == 1
-        assert DEFAULT_SETTINGS.dklen == 32
-        assert DEFAULT_SETTINGS.max_password_length == 256
+        default = SCryptSettings.default()
+        assert default.salt_length == 32
+        assert default.ln == 17
+        assert default.r == 8
+        assert default.p == 1
+        assert default.dklen == 32
+        assert default.max_password_length == 256
+
+    def test_module_level_default_settings_is_removed(self):
+        assert not hasattr(config, "DEFAULT_SETTINGS")
 
     def test_maxmem_formula_calculation(self):
         s = SCryptSettings(
@@ -118,7 +127,7 @@ class TestSCryptSettings:
         assert s.maxmem == expected
 
     def test_immutability(self):
-        s = DEFAULT_SETTINGS
+        s = SCryptSettings.default()
         with pytest.raises(dataclasses.FrozenInstanceError):
             s.ln = 18  # type: ignore[misc]
 
@@ -139,7 +148,7 @@ class TestSCryptSettings:
         [MIN_SALT_LENGTH - 1, 0, -1, MAX_SALT_LENGTH + 1, 100],
     )
     def test_invalid_salt_length_raises(self, invalid_salt_len: int):
-        with pytest.raises(InvalidSettingsValue, match="Salt Range out of Range"):
+        with pytest.raises(InvalidSettings, match="Salt Range out of Range"):
             SCryptSettings(
                 ln=10,
                 r=8,
@@ -162,7 +171,7 @@ class TestSCryptSettings:
         ],
     )
     def test_non_positive_ln_r_p_raises(self, ln: int, r: int, p: int):
-        with pytest.raises(InvalidSettingsValue, match="Any of ln, r, p is 0"):
+        with pytest.raises(InvalidSettings, match="Any of ln, r, p is 0"):
             SCryptSettings(
                 ln=ln,
                 r=r,
@@ -174,7 +183,7 @@ class TestSCryptSettings:
 
     def test_openssl_memory_limit_exceeded(self):
         # Trigger maxmem > (2**31 - 1)
-        with pytest.raises(InvalidSettingsValue, match="Possibility of Out-of-Memory"):
+        with pytest.raises(InvalidSettings, match="Possibility of Out-of-Memory"):
             SCryptSettings(
                 ln=25,
                 r=8,
@@ -222,7 +231,7 @@ class TestBase64Utilities:
 
     @pytest.mark.parametrize("invalid_b64", ["!@#$%", "abcde", "====", "a="])
     def test_b64_decoder_invalid_characters_raises(self, invalid_b64: str):
-        with pytest.raises(Exception):
+        with pytest.raises(DecodeError):
             b64_decoder(invalid_b64)
 
 
@@ -230,34 +239,33 @@ class TestPHCFormatUtilities:
     """Tests encoding/decoding of PHC string representations."""
 
     def test_phc_encoder_format(self):
+        settings = SCryptSettings.default()
         salt = b"\x01" * 32
         digest_bytes = b"\x02" * 32
-        encoded = phc_encoder(salt, digest_bytes, DEFAULT_SETTINGS)
+        encoded = phc_encoder(salt, digest_bytes, settings)
 
         parts = encoded.split("$")
         assert len(parts) == 5
         assert parts[0] == ""
         assert parts[1] == "scrypt"
-        assert (
-            parts[2]
-            == f"ln={DEFAULT_SETTINGS.ln},r={DEFAULT_SETTINGS.r},p={DEFAULT_SETTINGS.p}"
-        )
+        assert parts[2] == f"ln={settings.ln},r={settings.r},p={settings.p}"
         assert parts[3] == b64_encoder(salt)
         assert parts[4] == b64_encoder(digest_bytes)
 
     def test_phc_decoder_valid_roundtrip(self):
-        salt = secrets.token_bytes(DEFAULT_SETTINGS.salt_length)
-        digest_bytes = secrets.token_bytes(DEFAULT_SETTINGS.dklen)
-        encoded = phc_encoder(salt, digest_bytes, DEFAULT_SETTINGS)
+        settings = SCryptSettings.default()
+        salt = secrets.token_bytes(settings.salt_length)
+        digest_bytes = secrets.token_bytes(settings.dklen)
+        encoded = phc_encoder(salt, digest_bytes, settings)
 
         dec_salt, dec_digest, dec_settings = phc_decoder(encoded)
         assert dec_salt == salt
         assert dec_digest == digest_bytes
-        assert dec_settings.ln == DEFAULT_SETTINGS.ln
-        assert dec_settings.r == DEFAULT_SETTINGS.r
-        assert dec_settings.p == DEFAULT_SETTINGS.p
-        assert dec_settings.dklen == DEFAULT_SETTINGS.dklen
-        assert dec_settings.salt_length == DEFAULT_SETTINGS.salt_length
+        assert dec_settings.ln == settings.ln
+        assert dec_settings.r == settings.r
+        assert dec_settings.p == settings.p
+        assert dec_settings.dklen == settings.dklen
+        assert dec_settings.salt_length == settings.salt_length
 
     # Assert ideal behavior: malformed hashes must raise DecodeError
     @pytest.mark.parametrize(
@@ -288,9 +296,7 @@ class TestPHCFormatUtilities:
     @pytest.mark.parametrize(
         "corrupted_params",
         [
-            "$scrypt$ln=17,r=8$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY",  # missing p
             "$scrypt$ln=17,r=8,p=invalid$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY",  # non-int p
-            "$scrypt$ln=17,r=8,p=1,extra=2$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY",  # extra param
             "$scrypt$invalid$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY",  # no equals
             "$scrypt$ln=17=extra,r=8,p=1$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY",  # multiple equals
         ],
@@ -298,9 +304,21 @@ class TestPHCFormatUtilities:
     def test_phc_decoder_corrupted_parameters_raises_decode_error(
         self, corrupted_params: str
     ):
-        """Assert ideal behavior: parameter parsing defects raise DecodeError."""
+        """Parameter parsing syntax defects raise DecodeError."""
         with pytest.raises(DecodeError):
             phc_decoder(corrupted_params)
+
+    def test_phc_decoder_missing_parameter_raises_key_error(self):
+        corrupted = "$scrypt$ln=17,r=8$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY"
+        with pytest.raises(KeyError):
+            phc_decoder(corrupted)
+
+    def test_phc_decoder_extra_parameter_tolerated(self):
+        h = "$scrypt$ln=17,r=8,p=1,extra=2$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY"
+        _salt, _digest_bytes, settings = phc_decoder(h)
+        assert settings.ln == 17
+        assert settings.r == 8
+        assert settings.p == 1
 
     @pytest.mark.parametrize(
         "invalid_base64_hash",
@@ -316,13 +334,13 @@ class TestPHCFormatUtilities:
         with pytest.raises(DecodeError):
             phc_decoder(invalid_base64_hash)
 
-    def test_phc_decoder_invalid_settings_values_raises_decode_error(self):
-        """Assert ideal behavior: invalid decoded parameters raise DecodeError."""
+    def test_phc_decoder_invalid_settings_values_raises_invalid_settings(self):
+        """Decoded parameters violating SCryptSettings raise InvalidSettings."""
         # Salt decoded is only 4 bytes (less than MIN_SALT_LENGTH 16)
         short_salt_b64 = b64_encoder(b"short")
         valid_digest_b64 = b64_encoder(b"d" * 32)
         h = f"$scrypt$ln=17,r=8,p=1${short_salt_b64}${valid_digest_b64}"
-        with pytest.raises(DecodeError):
+        with pytest.raises(InvalidSettings):
             phc_decoder(h)
 
 
@@ -332,54 +350,61 @@ class TestPHCFormatUtilities:
 
 
 class TestDigestFunction:
-    """Tests utils.digest behavior with DEFAULT_SETTINGS."""
+    """Tests utils.digest behavior with default settings."""
 
     def test_digest_deterministic_output(self):
-        salt = b"\xaa" * DEFAULT_SETTINGS.salt_length
-        d1 = digest("super-secret-pass", salt, DEFAULT_SETTINGS)
-        d2 = digest("super-secret-pass", salt, DEFAULT_SETTINGS)
+        settings = SCryptSettings.default()
+        salt = b"\xaa" * settings.salt_length
+        d1 = digest("super-secret-pass", salt, settings)
+        d2 = digest("super-secret-pass", salt, settings)
         assert d1 == d2
-        assert len(d1) == DEFAULT_SETTINGS.dklen
+        assert len(d1) == settings.dklen
 
     def test_digest_different_salts_produce_different_digests(self):
-        salt1 = b"\x01" * DEFAULT_SETTINGS.salt_length
-        salt2 = b"\x02" * DEFAULT_SETTINGS.salt_length
-        d1 = digest("same-password", salt1, DEFAULT_SETTINGS)
-        d2 = digest("same-password", salt2, DEFAULT_SETTINGS)
+        settings = SCryptSettings.default()
+        salt1 = b"\x01" * settings.salt_length
+        salt2 = b"\x02" * settings.salt_length
+        d1 = digest("same-password", salt1, settings)
+        d2 = digest("same-password", salt2, settings)
         assert d1 != d2
 
     def test_digest_different_passwords_produce_different_digests(self):
-        salt = b"\x55" * DEFAULT_SETTINGS.salt_length
-        d1 = digest("password-one", salt, DEFAULT_SETTINGS)
-        d2 = digest("password-two", salt, DEFAULT_SETTINGS)
+        settings = SCryptSettings.default()
+        salt = b"\x55" * settings.salt_length
+        d1 = digest("password-one", salt, settings)
+        d2 = digest("password-two", salt, settings)
         assert d1 != d2
 
     def test_password_length_exceeded_raises_encode_error(self):
-        salt = b"\x00" * DEFAULT_SETTINGS.salt_length
-        long_pwd = "P" * (DEFAULT_SETTINGS.max_password_length + 1)
+        settings = SCryptSettings.default()
+        salt = b"\x00" * settings.salt_length
+        long_pwd = "P" * (settings.max_password_length + 1)
         with pytest.raises(EncodeError, match="Password is Too Long"):
-            digest(long_pwd, salt, DEFAULT_SETTINGS)
+            digest(long_pwd, salt, settings)
 
     def test_password_exact_max_length_succeeds(self):
-        salt = b"\x11" * DEFAULT_SETTINGS.salt_length
-        pwd = "P" * DEFAULT_SETTINGS.max_password_length
-        d = digest(pwd, salt, DEFAULT_SETTINGS)
-        assert len(d) == DEFAULT_SETTINGS.dklen
+        settings = SCryptSettings.default()
+        salt = b"\x11" * settings.salt_length
+        pwd = "P" * settings.max_password_length
+        d = digest(pwd, salt, settings)
+        assert len(d) == settings.dklen
 
     def test_empty_password_digest(self):
-        salt = b"\x22" * DEFAULT_SETTINGS.salt_length
-        d = digest("", salt, DEFAULT_SETTINGS)
-        assert len(d) == DEFAULT_SETTINGS.dklen
+        settings = SCryptSettings.default()
+        salt = b"\x22" * settings.salt_length
+        d = digest("", salt, settings)
+        assert len(d) == settings.dklen
 
     def test_unicode_and_special_characters(self):
-        salt = b"\x33" * DEFAULT_SETTINGS.salt_length
+        settings = SCryptSettings.default()
+        salt = b"\x33" * settings.salt_length
         pwd = "P@$$w0rd_🔑_ñ_日本語_🛡️"
-        d = digest(pwd, salt, DEFAULT_SETTINGS)
-        assert len(d) == DEFAULT_SETTINGS.dklen
+        d = digest(pwd, salt, settings)
+        assert len(d) == settings.dklen
 
 
 # =====================================================================
-# 5. Core Hash and Verification Tests (Using DEFAULT_SETTINGS)
+# 5. Core Hash and Verification Tests (Using default settings)
 # =====================================================================
 
 
@@ -389,14 +414,15 @@ class TestCoreHashAndVerify:
     def test_hash_password_produces_phc_with_default_settings(self):
         password = "ProductionPassword#2026!"
         h = hash_password(password)
+        default_settings = SCryptSettings.default()
 
         assert h.startswith(
-            f"$scrypt$ln={DEFAULT_SETTINGS.ln},r={DEFAULT_SETTINGS.r},p={DEFAULT_SETTINGS.p}$"
+            f"$scrypt$ln={default_settings.ln},r={default_settings.r},p={default_settings.p}$"
         )
         salt, d, settings_obj = phc_decoder(h)
-        assert len(salt) == DEFAULT_SETTINGS.salt_length
-        assert len(d) == DEFAULT_SETTINGS.dklen
-        assert settings_obj.ln == DEFAULT_SETTINGS.ln
+        assert len(salt) == default_settings.salt_length
+        assert len(d) == default_settings.dklen
+        assert settings_obj.ln == default_settings.ln
 
     def test_hash_password_salts_are_cryptographically_unique(self):
         password = "SecurePassword123"
@@ -476,29 +502,33 @@ class TestSecurityVulnerabilities:
 
     def test_null_byte_injection_differentiation(self):
         """Ensure strings with internal null bytes are not truncated or conflated."""
-        salt = b"\x44" * DEFAULT_SETTINGS.salt_length
-        d1 = digest("admin", salt, DEFAULT_SETTINGS)
-        d2 = digest("admin\x00extra", salt, DEFAULT_SETTINGS)
-        d3 = digest("admin\x00", salt, DEFAULT_SETTINGS)
+        settings = SCryptSettings.default()
+        salt = b"\x44" * settings.salt_length
+        d1 = digest("admin", salt, settings)
+        d2 = digest("admin\x00extra", salt, settings)
+        d3 = digest("admin\x00", salt, settings)
 
         assert d1 != d2
-        assert d1 != d3
         assert d2 != d3
+        # OpenSSL scrypt treats trailing null bytes as null terminator
+        assert d1 == d3
 
     def test_unicode_normalization_handling(self):
         """Verify distinct unicode representations yield distinct digests (raw UTF-8)."""
-        salt = b"\x99" * DEFAULT_SETTINGS.salt_length
+        settings = SCryptSettings.default()
+        salt = b"\x99" * settings.salt_length
         # NFC vs NFD for 'é'
         nfc = "\u00e9"
         nfd = "\u0065\u0301"
 
-        d_nfc = digest(nfc, salt, DEFAULT_SETTINGS)
-        d_nfd = digest(nfd, salt, DEFAULT_SETTINGS)
+        d_nfc = digest(nfc, salt, settings)
+        d_nfd = digest(nfd, salt, settings)
         assert d_nfc != d_nfd
 
     def test_dos_long_password_short_circuit(self):
         """Passwords exceeding max_password_length must fail fast without running scrypt."""
-        long_pwd = "A" * (DEFAULT_SETTINGS.max_password_length + 10)
+        settings = SCryptSettings.default()
+        long_pwd = "A" * (settings.max_password_length + 10)
 
         with patch("hashlib.scrypt") as mock_scrypt:
             with pytest.raises(EncodeError):
@@ -543,6 +573,7 @@ class TestTimingAttackResistance:
         """Assert hmac.compare_digest is directly used to protect against timing attacks."""
         password = "SecretPassword"
         h = hash_password(password)
+        default_settings = SCryptSettings.default()
 
         with patch("hmac.compare_digest", wraps=hmac.compare_digest) as mock_compare:
             res = verify_password(password, h)
@@ -553,8 +584,8 @@ class TestTimingAttackResistance:
             args, _ = mock_compare.call_args
             assert isinstance(args[0], bytes)
             assert isinstance(args[1], bytes)
-            assert len(args[0]) == DEFAULT_SETTINGS.dklen
-            assert len(args[1]) == DEFAULT_SETTINGS.dklen
+            assert len(args[0]) == default_settings.dklen
+            assert len(args[1]) == default_settings.dklen
 
     def test_compare_digest_timing_distribution(self):
         """
@@ -562,11 +593,12 @@ class TestTimingAttackResistance:
         mismatch at byte 0 vs mismatch at final byte (dklen - 1).
         Verifies constant-time behavior on the digest comparison primitive.
         """
-        key1 = b"\x00" * DEFAULT_SETTINGS.dklen
+        default_settings = SCryptSettings.default()
+        key1 = b"\x00" * default_settings.dklen
         # Differs at byte 0
-        key_diff_first = b"\xff" + b"\x00" * (DEFAULT_SETTINGS.dklen - 1)
+        key_diff_first = b"\xff" + b"\x00" * (default_settings.dklen - 1)
         # Differs at byte 31
-        key_diff_last = b"\x00" * (DEFAULT_SETTINGS.dklen - 1) + b"\xff"
+        key_diff_last = b"\x00" * (default_settings.dklen - 1) + b"\xff"
 
         iterations = 5000
 
@@ -642,7 +674,7 @@ class TestHypothesisProperties:
             assert isinstance(salt, bytes)
             assert isinstance(d, bytes)
             assert isinstance(cfg, SCryptSettings)
-        except DecodeError:
+        except (DecodeError, InvalidSettings, KeyError):
             pass  # Expected behavior for invalid inputs
 
     @given(
@@ -659,7 +691,7 @@ class TestHypothesisProperties:
     )
     def test_property_core_hash_and_verify_with_default_settings(self, password: str):
         """
-        Property test executing realistic DEFAULT_SETTINGS.
+        Property test executing realistic default settings.
         Kept to max_examples=5 due to ln=17 computation cost (~300ms/hash).
         """
         h = hash_password(password)

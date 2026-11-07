@@ -15,3 +15,10 @@ dev = [
     "pytest-cov>=7.1.0,<8.0.0",
     "ruff>=0.17.3,<0.18.0",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+    "vuln: tests that currently expose a real weakness or vulnerability",
+]
+

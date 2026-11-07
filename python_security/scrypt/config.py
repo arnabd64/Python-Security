@@ -7,7 +7,7 @@ Description:
 
 from dataclasses import dataclass
 
-from python_security.scrypt.exceptions import InvalidSettingsValue
+from python_security.exceptions import InvalidSettings
 
 # Limits
 MIN_SALT_LENGTH = 16
@@ -42,17 +42,16 @@ class SCryptSettings:
 
     def __post_init__(self):
         if self.ln <= 0 or self.r <= 0 or self.p <= 0:
-            raise InvalidSettingsValue("Any of ln, r, p is 0")
+            raise InvalidSettings("Any of ln, r, p is 0")
         if not (MIN_SALT_LENGTH <= self.salt_length <= MAX_SALT_LENGTH):
-            raise InvalidSettingsValue(
+            raise InvalidSettings(
                 f"Salt Range out of Range. Recommended: [{MIN_SALT_LENGTH}, {MAX_SALT_LENGTH}]"
             )
         if self.maxmem > OPENSSL_MEMORY_LIMIT:
-            raise InvalidSettingsValue(
+            raise InvalidSettings(
                 "Possibility of Out-of-Memory. Reduce the values of ln, r, p"
             )
 
-
-DEFAULT_SETTINGS: SCryptSettings = SCryptSettings(
-    salt_length=32, ln=17, r=8, p=1, dklen=32, max_password_length=256
-)
+    @classmethod
+    def default(cls) -> "SCryptSettings":
+        return cls(salt_length=32, ln=17, r=8, p=1, dklen=32, max_password_length=256)

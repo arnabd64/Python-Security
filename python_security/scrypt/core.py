@@ -11,11 +11,11 @@ import hmac
 import secrets
 
 from python_security.scrypt import utils
-from python_security.scrypt.config import DEFAULT_SETTINGS, SCryptSettings
+from python_security.scrypt.config import SCryptSettings
 
 
 def hash_password(
-    plain_text_password: str, *, settings: SCryptSettings = DEFAULT_SETTINGS
+    plain_text_password: str, *, settings: SCryptSettings = SCryptSettings.default()
 ) -> str:
     """
     Hashes the plain_text_password with respect to the settings

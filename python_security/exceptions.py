@@ -10,6 +10,18 @@ Description:
 class InvalidSettings(Exception): ...
 
 
+# --------- SCrypt Exceptions ------
+
+
+class SCryptException(Exception): ...
+
+
+class EncodeError(SCryptException): ...
+
+
+class DecodeError(SCryptException): ...
+
+
 # --------- JWT Exceptions ---------
 class JWTException(Exception): ...
 

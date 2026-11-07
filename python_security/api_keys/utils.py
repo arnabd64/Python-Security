@@ -14,4 +14,5 @@ def key_digest(data: str) -> bytes:
 
 
 def verify_digest(secret: str, expected_digest: str) -> bool:
-    return hmac.compare_digest(key_digest(secret), expected_digest.encode())
+    digest_bytes = key_digest(secret).hex().encode("ascii")
+    return hmac.compare_digest(digest_bytes, expected_digest.lower().encode("utf-8"))

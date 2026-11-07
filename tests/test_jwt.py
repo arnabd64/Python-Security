@@ -36,12 +36,10 @@ comparison, jti uniqueness (including under threads) and API surface.
 import base64
 import hashlib
 import hmac
-import importlib.util
 import json
 import re
 import secrets
 import string
-import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -183,18 +181,13 @@ def frozen(now: int):
         yield
 
 
-def load_config(monkeypatch, **env):
-    """Execute config.py afresh under a controlled environment."""
+def load_config(monkeypatch, **env) -> JWTSettings:
+    """Load settings afresh from environment variables."""
     for key in ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    name = "_jwt_config_under_test"
-    spec = importlib.util.spec_from_file_location(name, config.__file__)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
-    spec.loader.exec_module(module)
-    return module
+    return JWTSettings.from_env()
 
 
 claims_st = st.dictionaries(
@@ -337,32 +330,32 @@ class TestSettings:
             load_config(monkeypatch, **env)
 
     def test_secret_is_read_from_environment(self, monkeypatch):
-        mod = load_config(monkeypatch, JWT_SECRET=SECRET)
-        assert mod.DEFAULT_SETTINGS.secret == SECRET
+        settings = load_config(monkeypatch, JWT_SECRET=SECRET)
+        assert settings.secret == SECRET
 
     def test_ttls_are_read_from_environment(self, monkeypatch):
-        mod = load_config(
+        settings = load_config(
             monkeypatch, JWT_SECRET=SECRET, JWT_ACCESS_TTL="60", JWT_REFRESH_TTL="3600"
         )
-        assert (mod.DEFAULT_SETTINGS.access_ttl, mod.DEFAULT_SETTINGS.refresh_ttl) == (
+        assert (settings.access_ttl, settings.refresh_ttl) == (
             60,
             3600,
         )
 
     def test_ttl_defaults_are_short_lived_access_long_lived_refresh(self, monkeypatch):
-        mod = load_config(monkeypatch, JWT_SECRET=SECRET)
-        assert mod.DEFAULT_SETTINGS.access_ttl == 15 * 60
-        assert mod.DEFAULT_SETTINGS.refresh_ttl == 5 * 24 * 3600
+        settings = load_config(monkeypatch, JWT_SECRET=SECRET)
+        assert settings.access_ttl == 15 * 60
+        assert settings.refresh_ttl == 5 * 24 * 3600
 
     def test_issuer_and_audience_come_from_environment(self, monkeypatch):
-        mod = load_config(
+        settings = load_config(
             monkeypatch, JWT_SECRET=SECRET, JWT_ISSUER="me", JWT_AUDIENCE="you"
         )
-        assert (mod.DEFAULT_SETTINGS.iss, mod.DEFAULT_SETTINGS.aud) == ("me", "you")
+        assert (settings.iss, settings.aud) == ("me", "you")
 
     def test_issuer_and_audience_defaults(self, monkeypatch):
-        mod = load_config(monkeypatch, JWT_SECRET=SECRET)
-        assert (mod.DEFAULT_SETTINGS.iss, mod.DEFAULT_SETTINGS.aud) == (
+        settings = load_config(monkeypatch, JWT_SECRET=SECRET)
+        assert (settings.iss, settings.aud) == (
             "JWTService",
             "All",
         )
@@ -386,11 +379,14 @@ class TestSettings:
                 JWT_REFRESH_TTL="10",
             )
 
-    def test_module_level_default_settings_are_valid(self):
-        d = config.DEFAULT_SETTINGS
-        assert isinstance(d, JWTSettings)
-        assert config.MIN_SECRET_LENGTH <= len(d.secret) <= config.MAX_SECRET_LENGTH
-        assert d.refresh_ttl >= d.access_ttl
+    def test_default_delegates_to_from_env(self, monkeypatch):
+        settings = load_config(monkeypatch, JWT_SECRET=SECRET)
+        default_settings = JWTSettings.default()
+        assert default_settings == settings
+
+    def test_module_level_default_settings_and_loader_are_removed(self):
+        assert not hasattr(config, "DEFAULT_SETTINGS")
+        assert not hasattr(config, "_load_settings_from_env")
 
 
 # =========================================================================== #

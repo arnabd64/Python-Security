@@ -12,7 +12,7 @@ from python_security.api_keys import utils
 from python_security.api_keys.config import StatelessAPIKeySettings
 from python_security.exceptions import InvalidPrefix
 
-DEFAULT_SETTINGS = StatelessAPIKeySettings(length=24, prefix="sk")
+DEFAULT_SETTINGS = StatelessAPIKeySettings.default()
 
 
 def new_stateless_api_key(
@@ -23,24 +23,25 @@ def new_stateless_api_key(
     cryptographically generated string. Good for simple use cases.
 
     Args:
-        - `key_length` (int) : Length of the key secret
-        - `prefix` (str) : Prefix to use with the API Key
+        - `settings` (StatelessAPIKeySettings): Configuration for the key
 
     Returns:
         - `api_key` (str): The API Key
-        - `key_hash` (str): Key hash that can be used to verify
+        - `key_hash` (str): Hex key hash that can be used to verify
     """
     # generate the key
     key: str = secrets.token_hex(settings.length)
 
     # generate a hash for the key
-    digest: str = utils.key_digest(key).decode()
+    digest: str = utils.key_digest(key).hex()
 
     return f"{settings.prefix}-{key}", digest
 
 
 def verify_stateless_api_key(
-    key: str, digest: str, settings: StatelessAPIKeySettings = DEFAULT_SETTINGS
+    key: str,
+    digest: str,
+    settings: StatelessAPIKeySettings = DEFAULT_SETTINGS,
 ) -> bool:
     """
     Verifies a stateless API Key

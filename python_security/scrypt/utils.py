@@ -9,8 +9,8 @@ import base64
 import binascii
 import hashlib
 
+from python_security.exceptions import DecodeError, EncodeError
 from python_security.scrypt.config import SCryptSettings
-from python_security.scrypt.exceptions import DecodeError, EncodeError
 
 
 def b64_encoder(data: bytes) -> str:
@@ -43,10 +43,14 @@ def phc_decoder(hashed_password: str):
         raise DecodeError("hashed_password is malformed")
 
     # extract components
-    kv: dict[str, int] = {}
-    for param in params.split(","):
-        key, value = param.split("=")
-        kv[key] = int(value)
+    try:
+        kv: dict[str, int] = {}
+        for param in params.split(","):
+            key, value = param.split("=")
+            kv[key] = int(value)
+
+    except ValueError:
+        raise DecodeError("Unable to extract scrypt paramaeters")
 
     salt: bytes = b64_decoder(b64_salt)
     digest: bytes = b64_decoder(b64_digest)

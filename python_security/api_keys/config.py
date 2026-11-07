@@ -20,3 +20,7 @@ class StatelessAPIKeySettings:
     def __post_init__(self) -> None:
         if not (8 <= self.length <= MAX_API_KEY_LENGTH):
             raise InvalidSettings(f"length should be within [8, {MAX_API_KEY_LENGTH}]")
+
+    @classmethod
+    def default(cls) -> "StatelessAPIKeySettings":
+        return cls(length=32, prefix="sk")
